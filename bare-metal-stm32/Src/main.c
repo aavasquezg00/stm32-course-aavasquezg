@@ -62,7 +62,7 @@ void init_tim3(void){
     RCC->APB1ENR |= RCC_APB1ENR_TIM3EN; // Habilitar reloj para TIM3
 
     TIM3->CNT = 0; // Reiniciar contador
-    TIM3->PSC = (16000 - 1); // Para incrementar el CNT cada 0,1 us
+    TIM3->PSC = (1600 - 1); // Para incrementar el CNT cada 0,1 us
     TIM3->ARR = (2500 - 1); // Auto-reload para 1 segundo
 
     TIM3->CR1 &= ~(0b11 << TIM_CR1_CKD_Pos); // LImpia, la señal de 16MHz para sin cambios 
