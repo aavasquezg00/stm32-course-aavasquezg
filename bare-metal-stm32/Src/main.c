@@ -17,9 +17,28 @@
  */
 
 #include <stdint.h>
-
+#include "stm32f411xe.h"
 int main(void)
 {
+   // 1. Habilitar reloj para GPIOA
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;
+
+    // 2. Limpiar los bits de modo para PA5 y configurarlo como Salida (0b01)
+    GPIOA->MODER &= ~(0b11 << GPIO_MODER_MODE5_Pos);
+    GPIOA->MODER |= (0b01 << GPIO_MODER_MODE5_Pos);
+    
+    // 3. Configurar tipo de salida como Push-Pull (0)
+    GPIOA->OTYPER &= ~(GPIO_OTYPER_OT5);
+
+    // 4. Limpiar y establecer velocidad (opcional, p. ej. Very High Speed = 0b11)
+    GPIOA->OSPEEDR &= ~(0b11 << GPIO_OSPEEDR_OSPEED5_Pos);
+    GPIOA->OSPEEDR |= (0b11 << GPIO_OSPEEDR_OSPEED5_Pos);
+
+    // 5. Sin resistencias de Pull-up / Pull-down (0b00)
+    GPIOA->PUPDR &= ~(0b11 << GPIO_PUPDR_PUPD5_Pos);
+
+    // 6. Encender el pin PA5
+    GPIOA->ODR |= (GPIO_ODR_OD5);
     /* Loop forever */
 	for(;;);
 }
