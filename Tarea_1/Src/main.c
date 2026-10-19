@@ -33,189 +33,255 @@
 #include "stm32f4xx.h"
 #include "stm32f411xe.h"
 
-// Variables globales compartidas con ISRs deben ser volatile
-volatile uint16_t contador = 0;
-volatile uint8_t digito_actual = 0;
-volatile uint8_t cambio_digito_flag = 0;
-volatile uint8_t tick_1s_flag = 0;
-volatile uint8_t valor[4] = {0, 0, 0, 0};
+// CAMBIO: las variables que se modifican en una ISR y se leen en el main
+// (o al revés) se declaran volatile para que el compilador no las optimice.
+volatile uint16_t contador = 0;          // Valor que se muestra (0 - 9999)
+volatile uint8_t digito_actual = 0;      // Dígito que toca refrescar (0 = miles ... 3 = unidades)
+volatile uint8_t cambio_digito_flag = 0; // TIM3 la levanta cada 3 ms para pedir el cambio de dígito
+uint8_t bit = 0;                         // Bit auxiliar del patrón de segmentos
+uint8_t valor[4] = {0,0,0,0};            // Número (0-9) que va en cada dígito
 
 void gpio_init(void);
 void tim9_init(void);
 void tim3_init(void);
 
-void activar_digito(uint8_t d);
-void escribir_digito(uint8_t d);
+// CAMBIO: ahora reciben el dígito como parámetro (d). El main saca una copia
+// de digito_actual y la usa en ambas funciones, así la ISR no puede cambiarlo
+// entre escribir() y cambiar_digito().
+void cambiar_digito(uint8_t d);
+void escribir(uint8_t d);
 void apagar(void);
-void actualizar_digitos_array(void);
 
-typedef struct {
-    GPIO_TypeDef* puerto;
-    uint8_t pin;
-} PinSegmento;
+typedef enum {
+    REPOSO,
+    INCREMENTO,
+    DECREMENTO,
+    ACTUALIZAR   // No se usa por ahora
+} EstadoSistema;
 
-const PinSegmento mapa_segmentos[7] = {
-    {GPIOB, 12}, // Segmento A
-    {GPIOA, 12}, // Segmento B
-    {GPIOC, 11}, // Segmento C
-    {GPIOC, 12}, // Segmento D
-    {GPIOC, 10}, // Segmento E
-    {GPIOA, 11}, // Segmento F
-    {GPIOD, 2}   // Segmento G
+typedef struct{
+    GPIO_TypeDef*puerto;
+    uint8_t pin;    
+}PinSegmento;
+
+// Cada segmento (a-g) con su puerto y pin
+const PinSegmento mapa_segmentos[7]={
+    {GPIOB, 12},  // Segmento A -> PB12
+    {GPIOA, 12},  // Segmento B -> PA12
+    {GPIOC, 11}, // Segmento C -> PC11
+    {GPIOC, 12},  // Segmento D -> PC12
+    {GPIOC, 10}, // Segmento E -> PC10
+    {GPIOA, 11},  // Segmento F -> PA11
+    {GPIOD, 2}   // Segmento G -> PD2
 };
 
-// Ánodo común: 0 = Encendido, 1 = Apagado
+// Bit 0 = segmento A ... bit 6 = segmento G (bit 7 = punto, no se usa)
+// 0 = segmento encendido, 1 = apagado
 const uint8_t tabla_7seg[10] = {
-    0b11000000, // 0
-    0b11111001, // 1
-    0b10100100, // 2
-    0b10110000, // 3
-    0b10011001, // 4
-    0b10010010, // 5
-    0b10000010, // 6
-    0b11111000, // 7
-    0b10000000, // 8
-    0b10010000  // 9
+    0b11000000, // 0 (A,B,C,D,E,F encendidos; G y DP apagados)
+    0b11111001, // 1 (B,C encendidos)
+    0b10100100, // 2 (A,B,D,E,G encendidos)
+    0b10110000, // 3 (A,B,C,D,G encendidos)
+    0b10011001, // 4 (B,C,F,G encendidos)
+    0b10010010, // 5 (A,C,D,F,G encendidos)
+    0b10000010, // 6 (A,C,D,E,F,G encendidos)
+    0b11111000, // 7 (A,B,C encendidos)
+    0b10000000, // 8 (A,B,C,D,E,F,G encendidos)
+    0b10010000  // 9 (A,B,C,D,F,G encendidos)
 };
+
+// CAMBIO: volatile, porque las ISR la modifican
+volatile EstadoSistema Estado = REPOSO;
 
 int main(void)
-{
+{   
     gpio_init();
-    tim9_init();
-    tim3_init();
+    tim9_init();   // Base de 1 segundo (incremento + blinky)
+    tim3_init();   // Base de 3 ms (multiplexado de los displays)
 
-    actualizar_digitos_array(); // Carga inicial de valor[]
 
-    while (1) {
-        // Refresco del multiplexado
-        if (cambio_digito_flag) {
-            cambio_digito_flag = 0;         // Limpiar primero para no perder ticks
-            uint8_t d = digito_actual;      // Copia local: la ISR puede cambiarlo
+    while(1){
 
-            apagar();                       // 1. Apaga dígitos previos (evita ghosting)
-            escribir_digito(d);             // 2. Setea pines de segmentos del dígito d
-            activar_digito(d);              // 3. Activa el pin/transistor del dígito d
-        }
+        switch (Estado) {
+            
+            case(REPOSO):
+                if (cambio_digito_flag) {
+                    // CAMBIO: se limpia la bandera primero, para no perder
+                    // un aviso de TIM3 que llegue mientras se procesa
+                    cambio_digito_flag = 0;
+                    uint8_t d = digito_actual;  // Copia local del dígito a refrescar
 
-        // Evento de 1 segundo
-        if (tick_1s_flag) {
-            tick_1s_flag = 0;
-            contador = (contador + 1) % 10000;   // Acotado a 0-9999
-            // Para decrementar: contador = (contador == 0) ? 9999 : contador - 1;
-            actualizar_digitos_array();
+                    apagar();           // 1. Apaga el dígito anterior (elimina ghosting)
+                    escribir(d);        // 2. Prepara los nuevos segmentos
+                    cambiar_digito(d);  // 3. Enciende el nuevo dígito
+                }
+                break;
+            case(INCREMENTO):
+                // CAMBIO: se vuelve a REPOSO antes de modificar el contador,
+                // así si la ISR cambia el estado mientras se procesa, no se pierde
+                Estado = REPOSO;
+
+                contador = (contador + 1) % 10000;   // CAMBIO: acotado a 0-9999
+                break;
+            case(DECREMENTO):
+                Estado = REPOSO;
+
+                contador = (contador == 0) ? 9999 : contador - 1;  // CAMBIO: sin pasar de 0 a 65535
+                break;
+            default:
+
+                Estado = REPOSO;
+                break;
         }
     }
 }
 
-void actualizar_digitos_array(void) {
-    uint16_t c = contador;
-    valor[0] = (c / 1000) % 10; // Miles
-    valor[1] = (c / 100) % 10;  // Centenas
-    valor[2] = (c / 10) % 10;   // Decenas
-    valor[3] = c % 10;          // Unidades
+void gpio_init(void){
+    //Se encienden las señales de reloj
+    RCC->AHB1ENR |= (RCC_AHB1ENR_GPIOAEN);
+    RCC->AHB1ENR |= (RCC_AHB1ENR_GPIOBEN);
+    RCC->AHB1ENR |= (RCC_AHB1ENR_GPIOCEN);
+    RCC->AHB1ENR |= (RCC_AHB1ENR_GPIODEN);
+    RCC->AHB1ENR |= (RCC_AHB1ENR_GPIOHEN);
+
+    //Configuramos el gpioh de la salida del blinky PH1
+    GPIOH->MODER  &= ~(GPIO_MODER_MODE1);
+    GPIOH->MODER |= (GPIO_MODER_MODE1_0);
+    GPIOH->OTYPER &= ~(GPIO_OTYPER_OT1);
+    GPIOH->OSPEEDR &= ~(GPIO_OSPEEDR_OSPEED1);
+    GPIOH->PUPDR &= ~(GPIO_PUPDR_PUPD1);
+    GPIOH->ODR &= ~(GPIO_ODR_OD1);
+
+    // En cada puerto primero se pone el nivel en ODR (todo en 1 = apagado) y
+    // después se pasa el pin a salida, para que no haya un destello al arrancar.
+
+    //Configuramos el gpioa de la entrada del 7 segmentos
+    GPIOA->ODR |= (GPIO_ODR_OD12|GPIO_ODR_OD11);
+    GPIOA->MODER  &= ~(GPIO_MODER_MODE12|GPIO_MODER_MODE11);
+    GPIOA->MODER |= (GPIO_MODER_MODE12_0|GPIO_MODER_MODE11_0);
+    GPIOA->OTYPER &= ~(GPIO_OTYPER_OT12|GPIO_OTYPER_OT11);
+    GPIOA->OSPEEDR &= ~(GPIO_OSPEEDR_OSPEED12|GPIO_OSPEEDR_OSPEED11);
+    GPIOA->PUPDR &= ~(GPIO_PUPDR_PUPD12|GPIO_PUPDR_PUPD11);
+
+    GPIOC->ODR |= (GPIO_ODR_OD10|GPIO_ODR_OD12|GPIO_ODR_OD11|GPIO_ODR_OD5|GPIO_ODR_OD13|GPIO_ODR_OD6);
+    GPIOC->MODER  &= ~(GPIO_MODER_MODE10|GPIO_MODER_MODE12|GPIO_MODER_MODE11|GPIO_MODER_MODE5|GPIO_MODER_MODE13|GPIO_MODER_MODE6);
+    GPIOC->MODER |= (GPIO_MODER_MODE10_0|GPIO_MODER_MODE12_0|GPIO_MODER_MODE11_0|GPIO_MODER_MODE5_0|GPIO_MODER_MODE13_0|GPIO_MODER_MODE6_0);
+    GPIOC->OTYPER &= ~(GPIO_OTYPER_OT10|GPIO_OTYPER_OT12|GPIO_OTYPER_OT11|GPIO_OTYPER_OT5|GPIO_OTYPER_OT13|GPIO_OTYPER_OT6);
+    GPIOC->OSPEEDR &= ~(GPIO_OSPEEDR_OSPEED10|GPIO_OSPEEDR_OSPEED12|GPIO_OSPEEDR_OSPEED11|GPIO_OSPEEDR_OSPEED5|GPIO_OSPEEDR_OSPEED13|GPIO_OSPEEDR_OSPEED6);
+    GPIOC->PUPDR &= ~(GPIO_PUPDR_PUPD10|GPIO_PUPDR_PUPD12|GPIO_PUPDR_PUPD11|GPIO_PUPDR_PUPD5|GPIO_PUPDR_PUPD13|GPIO_PUPDR_PUPD6);
+
+    GPIOB->ODR |= (GPIO_ODR_OD12|GPIO_ODR_OD7);
+    GPIOB->MODER  &= ~(GPIO_MODER_MODE12|GPIO_MODER_MODE7);
+    GPIOB->MODER |= (GPIO_MODER_MODE12_0|GPIO_MODER_MODE7_0);
+    GPIOB->OTYPER &= ~(GPIO_OTYPER_OT12|GPIO_OTYPER_OT7);
+    GPIOB->OSPEEDR &= ~(GPIO_OSPEEDR_OSPEED12|GPIO_OSPEEDR_OSPEED7);
+    GPIOB->PUPDR &= ~(GPIO_PUPDR_PUPD12|GPIO_PUPDR_PUPD7);
+
+    GPIOD->ODR |= (GPIO_ODR_OD2);
+    GPIOD->MODER  &= ~(GPIO_MODER_MODE2);
+    GPIOD->MODER |= (GPIO_MODER_MODE2_0);
+    GPIOD->OTYPER &= ~(GPIO_OTYPER_OT2);
+    GPIOD->OSPEEDR &= ~(GPIO_OSPEEDR_OSPEED2);
+    GPIOD->PUPDR &= ~(GPIO_PUPDR_PUPD2);
+
+
 }
 
-void gpio_init(void) {
-    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN | RCC_AHB1ENR_GPIOBEN |
-                    RCC_AHB1ENR_GPIOCEN | RCC_AHB1ENR_GPIODEN | RCC_AHB1ENR_GPIOHEN;
-
-    // Configuración PH1 (Salida)
-    GPIOH->MODER  &= ~GPIO_MODER_MODE1;
-    GPIOH->MODER  |=  GPIO_MODER_MODE1_0;
-
-    // Configuración GPIOA (PA11, PA12 como salidas)
-    GPIOA->MODER  &= ~(GPIO_MODER_MODE11 | GPIO_MODER_MODE12);
-    GPIOA->MODER  |=  (GPIO_MODER_MODE11_0 | GPIO_MODER_MODE12_0);
-
-    // Configuración GPIOC (PC5, PC6, PC10, PC11, PC12, PC13 como salidas)
-    GPIOC->MODER  &= ~(GPIO_MODER_MODE5 | GPIO_MODER_MODE6 | GPIO_MODER_MODE10 |
-                       GPIO_MODER_MODE11 | GPIO_MODER_MODE12 | GPIO_MODER_MODE13);
-    GPIOC->MODER  |=  (GPIO_MODER_MODE5_0 | GPIO_MODER_MODE6_0 | GPIO_MODER_MODE10_0 |
-                       GPIO_MODER_MODE11_0 | GPIO_MODER_MODE12_0 | GPIO_MODER_MODE13_0);
-
-    // Configuración GPIOB (PB7, PB12 como salidas)
-    GPIOB->MODER  &= ~(GPIO_MODER_MODE7 | GPIO_MODER_MODE12);
-    GPIOB->MODER  |=  (GPIO_MODER_MODE7_0 | GPIO_MODER_MODE12_0);
-
-    // Configuración GPIOD (PD2 como salida)
-    GPIOD->MODER  &= ~GPIO_MODER_MODE2;
-    GPIOD->MODER  |=  GPIO_MODER_MODE2_0;
-
-    apagar();
-}
-
-void tim9_init(void) {
-    RCC->APB2ENR |= RCC_APB2ENR_TIM9EN;
-
+void tim9_init(void){
+    RCC->APB2ENR |= (RCC_APB2ENR_TIM9EN);
+    
     TIM9->CNT = 0;
-    TIM9->PSC = 16000 - 1; // Tick de 1 ms (16MHz / 16000)
-    TIM9->ARR = 1000 - 1;  // Interrupción cada 1 segundo
-    TIM9->EGR = TIM_EGR_UG;      // Fuerza la carga de PSC/ARR
-    TIM9->SR  = ~TIM_SR_UIF;     // Limpia la bandera que generó el UG
-    TIM9->DIER |= TIM_DIER_UIE;
-
+    TIM9->PSC = (16000-1);   // 16 MHz / 16000 = 1 kHz (tick de 1 ms)
+    TIM9->ARR = (1000-1);    // 1000 ticks = 1 segundo
+    TIM9->DIER |= (TIM_DIER_UIE);
+    TIM9->CR1 &= ~(TIM_CR1_CKD);
+    TIM9->CR1 &= ~(TIM_CR1_ARPE);
+    // CAMBIO: PSC solo se carga con un evento de actualización. Se fuerza
+    // con UG para que el primer segundo no salga casi instantáneo, y luego
+    // se limpia la bandera que genera.
+    TIM9->EGR = TIM_EGR_UG;
+    TIM9->SR = ~(TIM_SR_UIF);
     NVIC_EnableIRQ(TIM1_BRK_TIM9_IRQn);
-    TIM9->CR1 |= TIM_CR1_CEN;
+    TIM9->CR1 |= (TIM_CR1_CEN);
 }
 
-void TIM1_BRK_TIM9_IRQHandler(void) {
-    if (TIM9->SR & TIM_SR_UIF) {
-        TIM9->SR = ~TIM_SR_UIF;
-        GPIOH->ODR ^= GPIO_ODR_OD1;
-        tick_1s_flag = 1;
+void TIM1_BRK_TIM9_IRQHandler(void){
+    if (TIM9->SR & TIM_SR_UIF){
+        GPIOH->ODR ^= (GPIO_ODR_OD1);   // Blinky en PH1
+        TIM9->SR = ~(TIM_SR_UIF);       // Limpia la bandera de interrupción
+        Estado = INCREMENTO;            // Pide al main que sume 1 al contador
     }
 }
 
-void tim3_init(void) {
-    RCC->APB1ENR |= RCC_APB1ENR_TIM3EN;
-
+void tim3_init(void){
+    RCC->APB1ENR |= (RCC_APB1ENR_TIM3EN);
+    
     TIM3->CNT = 0;
-    TIM3->PSC = 1600 - 1;  // Tick de 0.1 ms
-    TIM3->ARR = 30 - 1;    // Refresco multiplexado (~3 ms por dígito)
-    TIM3->EGR = TIM_EGR_UG;      // Fuerza la carga de PSC/ARR
-    TIM3->SR  = ~TIM_SR_UIF;     // Limpia la bandera que generó el UG
-    TIM3->DIER |= TIM_DIER_UIE;
-
+    TIM3->PSC = (1600-1);    // 16 MHz / 1600 = 10 kHz (tick de 0.1 ms)
+    TIM3->ARR = (30-1);      // 30 ticks = 3 ms por dígito (~83 Hz el display completo)
+    TIM3->DIER |= (TIM_DIER_UIE);
+    TIM3->CR1 &= ~(TIM_CR1_CKD);
+    TIM3->CR1 &= ~(TIM_CR1_ARPE);
+    TIM3->CR1 &= ~(TIM_CR1_DIR);
+    // CAMBIO: igual que en TIM9, se fuerza la carga de PSC con UG
+    TIM3->EGR = TIM_EGR_UG;
+    TIM3->SR = ~(TIM_SR_UIF);
     NVIC_EnableIRQ(TIM3_IRQn);
-    TIM3->CR1 |= TIM_CR1_CEN;
+    TIM3->CR1 |= (TIM_CR1_CEN);
 }
 
-void TIM3_IRQHandler(void) {
-    if (TIM3->SR & TIM_SR_UIF) {
-        TIM3->SR = ~TIM_SR_UIF;
-        digito_actual = (digito_actual + 1) % 4;
-        cambio_digito_flag = 1;
+void TIM3_IRQHandler(void){
+    if(TIM3->SR & TIM_SR_UIF){
+        TIM3->SR = ~(TIM_SR_UIF);                    // Limpia la bandera
+        digito_actual = (digito_actual+1) % 4;       // Siguiente dígito (0,1,2,3,0,...)
+        cambio_digito_flag = 1;                      // Avisa al main
     }
 }
 
-// Apaga los 4 dígitos (Para Ánodo Común pone las líneas de ánodo en LOW/0)
-void apagar(void) {
-    GPIOC->BSRR = GPIO_BSRR_BR5 | GPIO_BSRR_BR13 | GPIO_BSRR_BR6;
-    GPIOB->BSRR = GPIO_BSRR_BR7;
+// Deja todo en 1: segmentos apagados y los 4 dígitos desactivados
+void apagar(void){
+    GPIOA->ODR |= (GPIO_ODR_OD12|GPIO_ODR_OD11);
+    GPIOC->ODR |= (GPIO_ODR_OD10|GPIO_ODR_OD12|GPIO_ODR_OD11|GPIO_ODR_OD5|GPIO_ODR_OD13|GPIO_ODR_OD6);
+    GPIOB->ODR |= (GPIO_ODR_OD12|GPIO_ODR_OD7);
+    GPIOD->ODR |= (GPIO_ODR_OD2);
+
 }
 
-// Activa el dígito d (Para Ánodo Común pone la línea en HIGH/1)
-void activar_digito(uint8_t d) {
-    switch (d) {
-        case 0: GPIOC->BSRR = GPIO_BSRR_BS5;  break; // Miles (PC5)
-        case 1: GPIOC->BSRR = GPIO_BSRR_BS13; break; // Centenas (PC13)
-        case 2: GPIOC->BSRR = GPIO_BSRR_BS6;  break; // Decenas (PC6)
-        case 3: GPIOB->BSRR = GPIO_BSRR_BS7;  break; // Unidades (PB7)
+// Activa el dígito d (pin en 0 = encendido) y calcula el número que
+// le tocará mostrar en el siguiente refresco de ese dígito
+void cambiar_digito(uint8_t d){
+    switch(d){
+        case 0: 
+            GPIOC->ODR &= ~(GPIO_ODR_OD5);  // Enciende PIN 1 (PC5) -> Miles
+            valor[0] = (contador / 1000) % 10;
+            break;
+        case 1: 
+            GPIOC->ODR &= ~(GPIO_ODR_OD13); // Enciende PIN 2 (PC13) -> Centenas
+            valor[1] = (contador / 100) % 10;
+            break;
+        case 2: 
+            GPIOC->ODR &= ~(GPIO_ODR_OD6);  // Enciende PIN 3 (PC6) -> Decenas
+            valor[2] = (contador / 10) % 10; 
+            break;
+        case 3: 
+            GPIOB->ODR &= ~(GPIO_ODR_OD7);  // Enciende PIN 4 (PB7) -> Unidades
+            valor[3] = contador % 10; 
+            break;
     }
 }
 
-// Asigna los bits de los segmentos del dígito d mediante BSRR atómico
-void escribir_digito(uint8_t d) {
-    uint8_t patron = tabla_7seg[valor[d]];
+// Pone en los pines de los segmentos el patrón del número del dígito d
+// (bit en 0 = segmento encendido, en 1 = apagado)
+void escribir(uint8_t d){
+    for(uint8_t i = 0; i < 7; i++){
 
-    for (uint8_t i = 0; i < 7; i++) {
-        uint8_t bit_val = (patron >> i) & 0x01;
-        if (bit_val == 0) {
-            // Encender segmento (Ánodo común -> LOW)
-            mapa_segmentos[i].puerto->BSRR = (1U << (mapa_segmentos[i].pin + 16));
-        } else {
-            // Apagar segmento (Ánodo común -> HIGH)
-            mapa_segmentos[i].puerto->BSRR = (1U << mapa_segmentos[i].pin);
+        bit = (tabla_7seg[valor[d]] >> i) & 1;
+
+        if(bit == 0){
+            mapa_segmentos[i].puerto->ODR &= ~(0b1 << mapa_segmentos[i].pin);  // Enciende el segmento
+        }
+        else{
+            mapa_segmentos[i].puerto->ODR |= (0b1 << mapa_segmentos[i].pin);   // Apaga el segmento
         }
     }
 }
