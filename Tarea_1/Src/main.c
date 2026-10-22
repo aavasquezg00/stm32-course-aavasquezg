@@ -2,7 +2,7 @@
  ******************************************************************************
  * @file           : main.c
  * @author         : Aaron Igor Vasquez Gil
- * @brief          : Main program body
+ * @brief          : Contador en display 7 segmentos, controlado por fotocompuertas de crecimiento y decrecimiento 
  ******************************************************************************
  * @attention
  *
@@ -15,84 +15,67 @@
  *
  ******************************************************************************
  *
- * Contador de 4 digitos (0 a 65535) en display de 7 segmentos multiplexado.
- * La fotocompuerta de PA4 aumenta el contador y la de PC2 lo disminuye.
- * El led de PH1 parpadea cada segundo para saber que la tarjeta esta funcionando.
+ * Contador de 16 bits (0 a 65535) en 4 displays de 7 segmentos multiplexados.
+ * El display muestra los 4 dígitos bajos del valor.
+ * La fotocompuerta de PA4 suma 1 y la de PC2 resta 1.
+ * El LED de PH1 parpadea cada segundo para indicar que la tarjeta funciona.
  *
- * Digitos (se prenden con 0):   Segmentos (se prenden con 0):
- * PIN 1 ----- PC5  (miles)       a ----- PB12    e ----- PC10
- * PIN 2 ----- PC6  (centenas)    b ----- PA12    f ----- PA11
- * PIN 3 ----- PC13 (decenas)     c ----- PD2     g ----- PC11
- * PIN 4 ----- PB7  (unidades)    d ----- PC12
+ * PINES
+ *   Dígitos (se prenden con 0)      Segmentos (se prenden con 0)
+ *   PIN 1 ----- PC5  (miles)        a ----- PB12    e ----- PC10
+ *   PIN 2 ----- PC6  (centenas)     b ----- PA12    f ----- PA11
+ *   PIN 3 ----- PC13 (decenas)      c ----- PD2     g ----- PC11
+ *   PIN 4 ----- PB7  (unidades)     d ----- PC12
  *
- * Fotocompuertas:
- * PA4 ----- Aumenta (EXTI4)
- * PC2 ----- Disminuye (EXTI2)
+ *   Fotocompuertas                  LED de estado
+ *   PA4 ----- Aumenta (EXTI4)       PH1
+ *   PC2 ----- Disminuye (EXTI2)
  *
- * LED de estado ----- PH1
+ * FUNCIONAMIENTO
+ * - Arranque: se lee el nivel de cada fotocompuerta con el haz libre.
+ *   Las dos deben estar libres al encender.
+ * - TIM9 (1 s): invierte PH1 (LED 1 s encendido y 1 s apagado).
+ * - TIM3 (3 ms): pasa al siguiente dígito y avisa al main con una bandera.
+ *   Los 4 dígitos se barren en 12 ms (~83 Hz), así que se ven encendidos
+ *   a la vez.
+ * - EXTI4 y EXTI2: si el sistema está en REPOSO, pasan a AUMENTA o
+ *   DISMINUYE. Si no, el evento se ignora.
  *
- *
- * FUNCIONAMIENTO DEL SISTEMA
- * - Arranque: tras configurar los GPIO se espera un momento y se lee una sola
- *   vez el nivel de cada fotocompuerta con el haz libre (nivel_libre_inc y
- *   nivel_libre_dec). Por eso las dos deben estar libres al encender.
- * - TIM9 (interrupción cada 1 s): invierte PH1, así el LED queda 1 s
- *   encendido y 1 s apagado (blinky de 0,5 Hz) e indica que el MCU funciona.
- * - TIM3 (interrupción cada 3 ms): avanza al siguiente dígito y levanta
- *   cambio_digito_flag. Los 4 dígitos se barren en 12 ms (~83 Hz), por lo
- *   que el ojo los percibe encendidos a la vez (efecto POV). En cada cambio
- *   se apaga todo antes de escribir el siguiente dígito para evitar el
- *   "fantasma".
- * - EXTI4 (PA4) y EXTI2 (PC2): cada ISR baja su bandera y, solo si el sistema
- *   está en REPOSO, pasa el estado a AUMENTA o DISMINUYE. Si ya hay un
- *   conteo en proceso, el evento se ignora.
- * - Total: 4 interrupciones (TIM9, TIM3, EXTI4, EXTI2).
- *
- * MÁQUINA DE ESTADOS (main)
- *
- *   El refresco del display va fuera de la máquina de estados, así que se
- *   ejecuta en cualquier estado y la pantalla no se apaga mientras se cuenta.
+ * ESTADOS (main)
+ *   El refresco del display va fuera de la máquina de estados, así que
+ *   funciona siempre.
  *
  *   REPOSO           : espera a que una ISR cambie el estado.
- *   AUMENTA          : suma 1 al contador (una sola vez).
- *   ESPERA_AUMENTA   : espera a que PA4 vuelva a su nivel libre, borra los
- *                      flancos pendientes (rebotes) y vuelve a REPOSO.
- *   DISMINUYE        : resta 1 al contador (una sola vez).
- *   ESPERA_DISMINUYE : igual que ESPERA_AUMENTA, pero con PC2.
+ *   AUMENTA          : suma 1 al contador.
+ *   ESPERA_AUMENTA   : espera a que PA4 se libere y vuelve a REPOSO.
+ *   DISMINUYE        : resta 1 al contador.
+ *   ESPERA_DISMINUYE : espera a que PC2 se libere y vuelve a REPOSO.
  */
 
 #include <stdint.h>
 #include "stm32f4xx.h"
 #include "stm32f411xe.h"
 
-// Límite del contador (4 dígitos -> máximo 9999)
-#define CONTADOR_MAX      9999
-
-// Configuración de la lógica de los sensores de las fotocompuertas.
-// 1 = El sensor entrega un '0' cuando detecta paso (Activo Bajo).
-// 0 = El sensor entrega un '1' cuando detecta paso (Activo Alto).
+// Polaridad de cada sensor: 1 = activo bajo (da 0 al detectar), 0 = activo alto
 #define SENSOR_INC_ACTIVO_BAJO  1
 #define SENSOR_DEC_ACTIVO_BAJO  0
 
-// Nivel (0 o 1) que tiene cada sensor cuando NO hay nada tapando el haz.
-// Se lee una sola vez al arrancar, asi no se depende de adivinar la polaridad.
+// Nivel de cada sensor con el haz libre (se lee al arrancar)
 volatile uint8_t nivel_libre_inc = 0;
 volatile uint8_t nivel_libre_dec = 0;
 
-// Estas macros devuelven 1 cuando el sensor ya volvio a su nivel de reposo (haz libre).
-// Se usan en los estados de espera para saber cuando termino el paso del objeto.
+// Dan 1 cuando el sensor ya volvió a su nivel libre
 #define INC_LIBRE()  ((((GPIOA->IDR) >> 4) & 1) == nivel_libre_inc)
 #define DEC_LIBRE()  ((((GPIOC->IDR) >> 2) & 1) == nivel_libre_dec)
 
-// Variables globales volátiles porque cambian dentro de las ISR (interrupciones)
-volatile uint16_t contador = 0;             // Valor global a mostrar (0 - 9999)
-volatile uint8_t digito_actual = 0;         // Índice del dígito activo (0: miles, 1: centenas, 2: decenas, 3: unidades)
-volatile uint8_t cambio_digito_flag = 0;    // Bandera levantada por el Timer 3 para refrescar la pantalla
+// Variables compartidas con las ISR
+volatile uint16_t contador = 0;             // valor a mostrar
+volatile uint8_t digito_actual = 0;         // 0: miles, 1: centenas, 2: decenas, 3: unidades
+volatile uint8_t cambio_digito_flag = 0;    // TIM3 la levanta para refrescar el display
 
-uint8_t bit = 0;                            // Variable auxiliar para extraer bits individuales
-uint8_t valor[4] = {0, 0, 0, 0};            // Arreglo para guardar el número descompuesto [miles, centenas, decenas, unidades]
+uint8_t bit = 0;                            // bit del segmento actual
+uint8_t valor[4] = {0, 0, 0, 0};            // cifras [miles, centenas, decenas, unidades]
 
-// Declaración de funciones
 void gpio_init(void);
 void exti_init(void);
 void tim9_init(void);
@@ -102,10 +85,9 @@ void cambiar_digito(void);
 void escribir(void);
 void apagar(void);
 
-// Estados del sistema.
-// REPOSO: no hay ningun objeto pasando, se acepta cualquier fotocompuerta.
-// AUMENTA / DISMINUYE: la fotocompuerta detecto, falta que el main cuente (1 sola vez).
-// ESPERA_*: ya se conto, se espera a que el objeto termine de pasar antes de aceptar otro.
+// REPOSO: sin objeto pasando
+// AUMENTA / DISMINUYE: detectado, falta que el main cuente
+// ESPERA_*: ya contó, espera a que el objeto termine de pasar
 typedef enum {
     REPOSO,
     AUMENTA,
@@ -114,26 +96,24 @@ typedef enum {
     ESPERA_DISMINUYE
 } EstadoSistema;
 
-// Estructura conveniente para mapear qué pin y puerto le corresponden a cada segmento (a..g)
+// Puerto y pin de un segmento
 typedef struct{
     GPIO_TypeDef *puerto;
     uint8_t pin;
 } PinSegmento;
 
-// Arreglo ordenado con los pines de cada segmento [a, b, c, d, e, f, g].
-// Esto facilita iterar en un 'for' para encender/apagar segmentos.
+// Pines de los segmentos [a, b, c, d, e, f, g]
 const PinSegmento mapeo[7] = {
-    {GPIOB, 12}, // Segmento a -> PB12
-    {GPIOA, 12}, // Segmento b -> PA12
-    {GPIOD, 2},  // Segmento c -> PD2
-    {GPIOC, 12}, // Segmento d -> PC12
-    {GPIOC, 10}, // Segmento e -> PC10
-    {GPIOA, 11}, // Segmento f -> PA11
-    {GPIOC, 11}  // Segmento g -> PC11
+    {GPIOB, 12}, // a
+    {GPIOA, 12}, // b
+    {GPIOD, 2},  // c
+    {GPIOC, 12}, // d
+    {GPIOC, 10}, // e
+    {GPIOA, 11}, // f
+    {GPIOC, 11}  // g
 };
 
-// Tabla de codificación 7 segmentos (Activo en BAJO -> 0 enciende, 1 apaga).
-// Los bits representan los segmentos [g f e d c b a] del bit 6 al bit 0.
+// Bits [g f e d c b a]: 0 enciende el segmento y 1 lo apaga
 const uint8_t tabla_7seg[10] = {
     //     gfedcba
     0b11000000, // 0
@@ -148,17 +128,13 @@ const uint8_t tabla_7seg[10] = {
     0b10010000  // 9
 };
 
-// Variable de estado inicializada en REPOSO
 volatile EstadoSistema Estado = REPOSO;
 
 int main(void)
 {
-    // Inicialización de todos los periféricos
     gpio_init();
 
-    // Pequeña pausa para que las resistencias pull-up/pull-down se estabilicen
-    // y despues se guarda el nivel de cada sensor en reposo (con el haz libre).
-    // IMPORTANTE: al encender, las dos fotocompuertas deben estar libres.
+    // Pausa para que se estabilicen los pull-up/pull-down y se guarda el nivel libre
     for (volatile uint32_t i = 0; i < 200000; i++);
     nivel_libre_inc = (GPIOA->IDR >> 4) & 1;
     nivel_libre_dec = (GPIOC->IDR >> 2) & 1;
@@ -169,42 +145,39 @@ int main(void)
 
     while(1){
 
-        // El refresco del display va FUERA de la maquina de estados para que
-        // siga funcionando en cualquier estado y no se apague mientras se cuenta.
+        // Refresco del display
         if (cambio_digito_flag) {
-            apagar();          // 1. Apagamos todo para evitar sombras/efecto fantasma (ghosting)
-            escribir();        // 2. Colocamos los segmentos del nuevo dígito
-            cambiar_digito();  // 3. Encendemos el común del dígito correspondiente
+            apagar();          // evita el efecto fantasma
+            escribir();        // segmentos del dígito nuevo
+            cambiar_digito();  // enciende el común de ese dígito
 
-            cambio_digito_flag = 0; // Limpiamos la bandera
+            cambio_digito_flag = 0;
         }
 
-        // Maquina de estados: las ISR de las fotocompuertas son las que sacan al
-        // sistema de REPOSO y el main lo va llevando por los demas estados.
+        // Máquina de estados
         switch (Estado) {
 
             case(REPOSO):
-                // No hace nada, espera a que una interrupcion cambie el estado
+                // espera a una ISR
                 break;
 
             case(AUMENTA):
-                // Da la vuelta: despues de 65535 sigue 0
+                // después de 65535 sigue 0
                 contador++;
 
-                Estado = ESPERA_AUMENTA;   // ya conto, ahora espera a que el sensor se libere
+                Estado = ESPERA_AUMENTA;
                 break;
 
             case(ESPERA_AUMENTA):
-                // Mientras el objeto siga tapando el sensor no se hace nada,
-                // asi un mismo paso no se cuenta mas de una vez.
+                // un paso se cuenta una sola vez: espera a que el sensor se libere
                 if (INC_LIBRE()) {
-                    EXTI->PR = EXTI_PR_PR4;   // se borran flancos que hayan llegado (rebotes) mientras esperaba
+                    EXTI->PR = EXTI_PR_PR4;   // borra flancos pendientes (rebotes)
                     Estado = REPOSO;
                 }
                 break;
 
             case(DISMINUYE):
-                // Da la vuelta: antes de 0 sigue 65535
+                // antes de 0 sigue 65535
                 contador--;
 
                 Estado = ESPERA_DISMINUYE;
@@ -224,32 +197,29 @@ int main(void)
     }
 }
 
-/*
- * Configuración de Puertos de Entrada/Salida (GPIO)
- */
 void gpio_init(void){
-    // Encendemos los relojes de todos los puertos de GPIO que utilizaremos
+    // Relojes de los puertos
     RCC->AHB1ENR |= (RCC_AHB1ENR_GPIOAEN | RCC_AHB1ENR_GPIOBEN |
                      RCC_AHB1ENR_GPIOCEN | RCC_AHB1ENR_GPIODEN |
                      RCC_AHB1ENR_GPIOHEN);
 
-    // Configuración PH1: LED de estado
+    // PH1: LED de estado (salida push-pull, inicia apagado)
     GPIOH->MODER  &= ~(GPIO_MODER_MODE1);
-    GPIOH->MODER  |= (GPIO_MODER_MODE1_0); // Salida
-    GPIOH->OTYPER &= ~(GPIO_OTYPER_OT1);    // Push-pull
+    GPIOH->MODER  |= (GPIO_MODER_MODE1_0);
+    GPIOH->OTYPER &= ~(GPIO_OTYPER_OT1);
     GPIOH->OSPEEDR &= ~(GPIO_OSPEEDR_OSPEED1);
     GPIOH->PUPDR  &= ~(GPIO_PUPDR_PUPD1);
-    GPIOH->ODR    &= ~(GPIO_ODR_OD1);       // Inicia apagado
+    GPIOH->ODR    &= ~(GPIO_ODR_OD1);
 
-    // Configuramos el Puerto A (Segmentos b, f)
-    GPIOA->ODR    |= (GPIO_ODR_OD12|GPIO_ODR_OD11); // Estado inicial en alto (Apagados)
+    // Puerto A: segmentos b, f (inician en 1 = apagados)
+    GPIOA->ODR    |= (GPIO_ODR_OD12|GPIO_ODR_OD11);
     GPIOA->MODER  &= ~(GPIO_MODER_MODE12|GPIO_MODER_MODE11);
-    GPIOA->MODER  |= (GPIO_MODER_MODE12_0|GPIO_MODER_MODE11_0); // Salidas
+    GPIOA->MODER  |= (GPIO_MODER_MODE12_0|GPIO_MODER_MODE11_0);
     GPIOA->OTYPER &= ~(GPIO_OTYPER_OT12|GPIO_OTYPER_OT11);
     GPIOA->OSPEEDR &= ~(GPIO_OSPEEDR_OSPEED12|GPIO_OSPEEDR_OSPEED11);
     GPIOA->PUPDR  &= ~(GPIO_PUPDR_PUPD12|GPIO_PUPDR_PUPD11);
 
-    // Configuramos el Puerto C (Segmentos d, e, g y Comunes de Miles, Centenas, Decenas)
+    // Puerto C: segmentos d, e, g y dígitos de miles, centenas y decenas
     GPIOC->ODR    |= (GPIO_ODR_OD10|GPIO_ODR_OD12|GPIO_ODR_OD11|GPIO_ODR_OD5|GPIO_ODR_OD13|GPIO_ODR_OD6);
     GPIOC->MODER  &= ~(GPIO_MODER_MODE10|GPIO_MODER_MODE12|GPIO_MODER_MODE11|GPIO_MODER_MODE5|GPIO_MODER_MODE13|GPIO_MODER_MODE6);
     GPIOC->MODER  |= (GPIO_MODER_MODE10_0|GPIO_MODER_MODE12_0|GPIO_MODER_MODE11_0|GPIO_MODER_MODE5_0|GPIO_MODER_MODE13_0|GPIO_MODER_MODE6_0);
@@ -257,7 +227,7 @@ void gpio_init(void){
     GPIOC->OSPEEDR &= ~(GPIO_OSPEEDR_OSPEED10|GPIO_OSPEEDR_OSPEED12|GPIO_OSPEEDR_OSPEED11|GPIO_OSPEEDR_OSPEED5|GPIO_OSPEEDR_OSPEED13|GPIO_OSPEEDR_OSPEED6);
     GPIOC->PUPDR  &= ~(GPIO_PUPDR_PUPD10|GPIO_PUPDR_PUPD12|GPIO_PUPDR_PUPD11|GPIO_PUPDR_PUPD5|GPIO_PUPDR_PUPD13|GPIO_PUPDR_PUPD6);
 
-    // Configuramos el Puerto B (Segmento a y Común de Unidades)
+    // Puerto B: segmento a y dígito de unidades
     GPIOB->ODR    |= (GPIO_ODR_OD12|GPIO_ODR_OD7);
     GPIOB->MODER  &= ~(GPIO_MODER_MODE12|GPIO_MODER_MODE7);
     GPIOB->MODER  |= (GPIO_MODER_MODE12_0|GPIO_MODER_MODE7_0);
@@ -265,7 +235,7 @@ void gpio_init(void){
     GPIOB->OSPEEDR &= ~(GPIO_OSPEEDR_OSPEED12|GPIO_OSPEEDR_OSPEED7);
     GPIOB->PUPDR  &= ~(GPIO_PUPDR_PUPD12|GPIO_PUPDR_PUPD7);
 
-    // Configuramos el Puerto D (Segmento c)
+    // Puerto D: segmento c
     GPIOD->ODR    |= (GPIO_ODR_OD2);
     GPIOD->MODER  &= ~(GPIO_MODER_MODE2);
     GPIOD->MODER  |= (GPIO_MODER_MODE2_0);
@@ -273,121 +243,109 @@ void gpio_init(void){
     GPIOD->OSPEEDR &= ~(GPIO_OSPEEDR_OSPEED2);
     GPIOD->PUPDR  &= ~(GPIO_PUPDR_PUPD2);
 
-    // Configuración de Entradas para las Fotocompuertas
-
-    // PA4: Fotocompuerta Aumenta
-    GPIOA->MODER &= ~(GPIO_MODER_MODE4); // Modo Entrada (00)
+    // PA4: fotocompuerta que aumenta (entrada, pull según la polaridad)
+    GPIOA->MODER &= ~(GPIO_MODER_MODE4);
     GPIOA->PUPDR &= ~(GPIO_PUPDR_PUPD4);
 #if SENSOR_INC_ACTIVO_BAJO
-    GPIOA->PUPDR |= (GPIO_PUPDR_PUPD4_0); // Pull-up si activa por bajo
+    GPIOA->PUPDR |= (GPIO_PUPDR_PUPD4_0); // pull-up
 #else
-    GPIOA->PUPDR |= (GPIO_PUPDR_PUPD4_1); // Pull-down si activa por alto
+    GPIOA->PUPDR |= (GPIO_PUPDR_PUPD4_1); // pull-down
 #endif
 
-    // PC2: Fotocompuerta disminucion
-    GPIOC->MODER &= ~(GPIO_MODER_MODE2); // Modo Entrada (00)
+    // PC2: fotocompuerta que disminuye (entrada, pull según la polaridad)
+    GPIOC->MODER &= ~(GPIO_MODER_MODE2);
     GPIOC->PUPDR &= ~(GPIO_PUPDR_PUPD2);
 #if SENSOR_DEC_ACTIVO_BAJO
-    GPIOC->PUPDR |= (GPIO_PUPDR_PUPD2_0); // Pull-up
+    GPIOC->PUPDR |= (GPIO_PUPDR_PUPD2_0); // pull-up
 #else
-    GPIOC->PUPDR |= (GPIO_PUPDR_PUPD2_1); // Pull-down
+    GPIOC->PUPDR |= (GPIO_PUPDR_PUPD2_1); // pull-down
 #endif
 }
 
-/*
- * Configuración de Interrupciones Externas (EXTI) para las Fotocompuertas
- */
 void exti_init(void){
-    // Habilitar reloj de SYSCFG para poder mapear los pines a las líneas EXTI
+    // El SYSCFG conecta cada pin con su línea EXTI
     RCC->APB2ENR |= (RCC_APB2ENR_SYSCFGEN);
 
-    // Mapear PA4 a EXTI4 y PC2 a EXTI2
+    // PA4 -> EXTI4 y PC2 -> EXTI2
     SYSCFG->EXTICR[1] &= ~(SYSCFG_EXTICR2_EXTI4);
     SYSCFG->EXTICR[1] |= (SYSCFG_EXTICR2_EXTI4_PA);
     SYSCFG->EXTICR[0] &= ~(SYSCFG_EXTICR1_EXTI2);
     SYSCFG->EXTICR[0] |= (SYSCFG_EXTICR1_EXTI2_PC);
 
-    // Limpiar flancos previos
     EXTI->FTSR &= ~(EXTI_FTSR_TR4 | EXTI_FTSR_TR2);
     EXTI->RTSR &= ~(EXTI_RTSR_TR4 | EXTI_RTSR_TR2);
 
-    // Configurar si dispara por flanco de bajada (FTSR) o de subida (RTSR)
+    // Flanco de cada sensor según su polaridad
 #if SENSOR_INC_ACTIVO_BAJO
-    EXTI->FTSR |= (EXTI_FTSR_TR4);
+    EXTI->FTSR |= (EXTI_FTSR_TR4); // bajada
 #else
-    EXTI->RTSR |= (EXTI_RTSR_TR4);
+    EXTI->RTSR |= (EXTI_RTSR_TR4); // subida
 #endif
 
 #if SENSOR_DEC_ACTIVO_BAJO
-    EXTI->FTSR |= (EXTI_FTSR_TR2);
+    EXTI->FTSR |= (EXTI_FTSR_TR2); // bajada
 #else
-    EXTI->RTSR |= (EXTI_RTSR_TR2);
+    EXTI->RTSR |= (EXTI_RTSR_TR2); // subida
 #endif
 
-    // Limpiar interrupciones pendientes y desenmascarar
+    // Borra pendientes, habilita las líneas y las interrupciones en el NVIC
     EXTI->PR  = (EXTI_PR_PR4 | EXTI_PR_PR2);
     EXTI->IMR |= (EXTI_IMR_MR4 | EXTI_IMR_MR2);
 
-    // Habilitar en el controlador de interrupciones (NVIC)
     NVIC_EnableIRQ(EXTI4_IRQn);
     NVIC_EnableIRQ(EXTI2_IRQn);
 }
 
-// ISR: Fotocompuerta PA4 (Aumento)
+// PA4: aumenta
 void EXTI4_IRQHandler(void){
     if (EXTI->PR & EXTI_PR_PR4){
-        EXTI->PR = EXTI_PR_PR4;  // Limpiar bandera escribiendo 1
+        EXTI->PR = EXTI_PR_PR4;  // se baja escribiendo 1
 
-        // Solo se acepta el evento si el sistema esta en REPOSO.
-        // Si ya hay un conteo en proceso, este evento se ignora (no se pisa el estado).
+        // solo se acepta en REPOSO, si hay un conteo en proceso se ignora
         if (Estado == REPOSO) Estado = AUMENTA;
     }
 }
 
-// ISR: Fotocompuerta PC2 (Disminuye)
+// PC2: disminuye
 void EXTI2_IRQHandler(void){
     if (EXTI->PR & EXTI_PR_PR2){
-        EXTI->PR = EXTI_PR_PR2;  // Limpiar bandera escribiendo 1
+        EXTI->PR = EXTI_PR_PR2;
 
         if (Estado == REPOSO) Estado = DISMINUYE;
     }
 }
 
-/*
- * TIM9: Generador de tiempo de 1 segundo (Heartbeat LED)
- */
+// TIM9: 16 MHz / 16000 = 1 kHz, con ARR de 1000 desborda cada 1 s
 void tim9_init(void){
     RCC->APB2ENR |= (RCC_APB2ENR_TIM9EN);
 
     TIM9->CNT = 0;
-    TIM9->PSC = (16000-1); // 16 MHz / 16000 = 1 kHz (Base de tiempo de 1 ms)
-    TIM9->ARR = (1000-1);  // Cuenta hasta 1000 ms = 1 segundo
-    TIM9->DIER |= (TIM_DIER_UIE); // Habilitar interrupción por desbordamiento
+    TIM9->PSC = (16000-1);
+    TIM9->ARR = (1000-1);
+    TIM9->DIER |= (TIM_DIER_UIE);
     TIM9->CR1 &= ~(TIM_CR1_CKD);
     TIM9->CR1 &= ~(TIM_CR1_ARPE);
     TIM9->SR = ~(TIM_SR_UIF);
 
     NVIC_EnableIRQ(TIM1_BRK_TIM9_IRQn);
-    TIM9->CR1 |= (TIM_CR1_CEN); // Arrancar Timer 9
+    TIM9->CR1 |= (TIM_CR1_CEN);
 }
 
-// ISR TIM9: Cambia el estado del LED cada 1 segundo
+// Invierte el LED cada 1 s
 void TIM1_BRK_TIM9_IRQHandler(void){
     if (TIM9->SR & TIM_SR_UIF){
-        GPIOH->ODR ^= (GPIO_ODR_OD1); // Commuta el estado de PH1
-        TIM9->SR = ~(TIM_SR_UIF);     // Limpia la bandera del timer
+        GPIOH->ODR ^= (GPIO_ODR_OD1);
+        TIM9->SR = ~(TIM_SR_UIF);
     }
 }
 
-/*
- * TIM3: Temporizador para la multiplexación del Display (Frecuencia rápida para evitar parpadeo)
- */
+// TIM3: 16 MHz / 1600 = 10 kHz, con ARR de 30 desborda cada 3 ms
 void tim3_init(void){
     RCC->APB1ENR |= (RCC_APB1ENR_TIM3EN);
 
     TIM3->CNT = 0;
-    TIM3->PSC = (1600-1); // Prescaler
-    TIM3->ARR = (30-1);   // Dispara aproximadamente cada 3ms para refrescar rápido el dígito
+    TIM3->PSC = (1600-1);
+    TIM3->ARR = (30-1);
     TIM3->DIER |= (TIM_DIER_UIE);
     TIM3->CR1 &= ~(TIM_CR1_CKD);
     TIM3->CR1 &= ~(TIM_CR1_ARPE);
@@ -395,24 +353,20 @@ void tim3_init(void){
     TIM3->SR = ~(TIM_SR_UIF);
 
     NVIC_EnableIRQ(TIM3_IRQn);
-    TIM3->CR1 |= (TIM_CR1_CEN); // Arrancar Timer 3
+    TIM3->CR1 |= (TIM_CR1_CEN);
 }
 
-// ISR TIM3: Cambia de dígito y avisa al bucle principal
+// Pasa al siguiente dígito (0 -> 1 -> 2 -> 3 -> 0) y avisa al main
 void TIM3_IRQHandler(void){
     if(TIM3->SR & TIM_SR_UIF){
         TIM3->SR = ~(TIM_SR_UIF);
 
-        // Rotamos entre los 4 dígitos (0 -> 1 -> 2 -> 3 -> 0)
         digito_actual = (digito_actual + 1) % 4;
-        cambio_digito_flag = 1; // Bandera para procesar el refresco en main()
+        cambio_digito_flag = 1;
     }
 }
 
-/*
- * Desactiva todos los dígitos y segmentos (se ponen en 1 lógico)
- * Esto es indispensable para evitar "fantasmas" durante el refresco.
- */
+// Apaga segmentos y dígitos (todo en 1) para que no quede el número anterior
 void apagar(void){
     GPIOA->ODR |= (GPIO_ODR_OD12|GPIO_ODR_OD11);
     GPIOC->ODR |= (GPIO_ODR_OD10|GPIO_ODR_OD12|GPIO_ODR_OD11|GPIO_ODR_OD5|GPIO_ODR_OD13|GPIO_ODR_OD6);
@@ -420,47 +374,39 @@ void apagar(void){
     GPIOD->ODR |= (GPIO_ODR_OD2);
 }
 
-/*
- * Activa el común del dígito que toca mostrar
- * y calcula el número individual (Miles, Centenas, Decenas o Unidades).
- */
+// Enciende el dígito que toca y calcula su cifra
 void cambiar_digito(void){
     switch(digito_actual){
-        case 0: // Miles
+        case 0: // miles
             GPIOC->ODR &= ~(GPIO_ODR_OD5);
             valor[0] = (contador / 1000) % 10;
             break;
-        case 1: // Centenas
+        case 1: // centenas
             GPIOC->ODR &= ~(GPIO_ODR_OD6);
             valor[1] = (contador / 100) % 10;
             break;
-        case 2: // Decenas
+        case 2: // decenas
             GPIOC->ODR &= ~(GPIO_ODR_OD13);
             valor[2] = (contador / 10) % 10;
             break;
-        case 3: // Unidades
+        case 3: // unidades
             GPIOB->ODR &= ~(GPIO_ODR_OD7);
             valor[3] = contador % 10;
             break;
     }
 }
 
-/*
- * Toma el número a mostrar (0 a 9), consulta la tabla de segmentos
- * y aplica bit por bit el estado correspondiente a los pines de la tarjeta.
- */
+// Saca la cifra actual a los pines de los segmentos usando la tabla
 void escribir(void){
     for(uint8_t i = 0; i < 7; i++){
 
-        // Extraemos el bit 'i' correspondiente al segmento (0 = Encender, 1 = Apagar)
+        // bit i del patrón: 0 enciende, 1 apaga
         bit = (tabla_7seg[valor[digito_actual]] >> i) & 1;
 
         if(bit == 0){
-            // Enciende el segmento mandando un 0
             mapeo[i].puerto->ODR &= ~(0b1 << mapeo[i].pin);
         }
         else{
-            // Apaga el segmento mandando un 1
             mapeo[i].puerto->ODR |= (0b1 << mapeo[i].pin);
         }
     }
