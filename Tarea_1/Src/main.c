@@ -1,4 +1,3 @@
-
 /* main.c
  * Contador de 4 digitos (0 a 9999) en display de 7 segmentos multiplexado.
  * La fotocompuerta de PA4 aumenta el contador y la de PC2 lo disminuye.
@@ -11,8 +10,22 @@
  * PIN 4 ----- PB7  (unidades)    d ----- PC12
  *
  * Fotocompuertas:
- * PA4 ----- incrementa (EXTI4)
- * PC2 ----- decrementa (EXTI2)
+ * PA4 ----- Aumenta (EXTI4)
+ * PC2 ----- Disminuye (EXTI2)
+ *
+ * Maquina de estados:
+ *
+ *                 PA4 detecta                 main cuenta
+ *   REPOSO ------------------> AUMENTA ---------------------> ESPERA_AUMENTA
+ *     ^                                                            |
+ *     |                  PA4 se libera                             |
+ *     +------------------------------------------------------------+
+ *
+ *                 PC2 detecta                 main cuenta
+ *   REPOSO ------------------> DISMINUYE -------------------> ESPERA_DISMINUYE
+ *     ^                                                            |
+ *     |                  PC2 se libera                             |
+ *     +------------------------------------------------------------+
  */
 
 #include <stdint.h>
@@ -28,13 +41,23 @@
 #define SENSOR_INC_ACTIVO_BAJO  1
 #define SENSOR_DEC_ACTIVO_BAJO  0
 
+// Nivel (0 o 1) que tiene cada sensor cuando NO hay nada tapando el haz.
+// Se lee una sola vez al arrancar, asi no se depende de adivinar la polaridad.
+volatile uint8_t nivel_libre_inc = 0;
+volatile uint8_t nivel_libre_dec = 0;
+
+// Estas macros devuelven 1 cuando el sensor ya volvio a su nivel de reposo (haz libre).
+// Se usan en los estados de espera para saber cuando termino el paso del objeto.
+#define INC_LIBRE()  ((((GPIOA->IDR) >> 4) & 1) == nivel_libre_inc)
+#define DEC_LIBRE()  ((((GPIOC->IDR) >> 2) & 1) == nivel_libre_dec)
+
 // Variables globales volátiles porque cambian dentro de las ISR (interrupciones)
 volatile uint16_t contador = 0;             // Valor global a mostrar (0 - 9999)
 volatile uint8_t digito_actual = 0;         // Índice del dígito activo (0: miles, 1: centenas, 2: decenas, 3: unidades)
 volatile uint8_t cambio_digito_flag = 0;    // Bandera levantada por el Timer 3 para refrescar la pantalla
 
 uint8_t bit = 0;                            // Variable auxiliar para extraer bits individuales
-uint8_t valor[4] = {0, 0, 0, 0};  // Arreglo para guardar el número descompuesto [miles, centenas, decenas, unidades]
+uint8_t valor[4] = {0, 0, 0, 0};            // Arreglo para guardar el número descompuesto [miles, centenas, decenas, unidades]
 
 // Declaración de funciones
 void gpio_init(void);
@@ -46,12 +69,16 @@ void cambiar_digito(void);
 void escribir(void);
 void apagar(void);
 
-// Estados para el flujo de control principal
+// Estados del sistema.
+// REPOSO: no hay ningun objeto pasando, se acepta cualquier fotocompuerta.
+// AUMENTA / DISMINUYE: la fotocompuerta detecto, falta que el main cuente (1 sola vez).
+// ESPERA_*: ya se conto, se espera a que el objeto termine de pasar antes de aceptar otro.
 typedef enum {
     REPOSO,
-    INCREMENTO,
-    DECREMENTO,
-    ACTUALIZAR
+    AUMENTA,
+    ESPERA_AUMENTA,
+    DISMINUYE,
+    ESPERA_DISMINUYE
 } EstadoSistema;
 
 // Estructura conveniente para mapear qué pin y puerto le corresponden a cada segmento (a..g)
@@ -62,7 +89,7 @@ typedef struct{
 
 // Arreglo ordenado con los pines de cada segmento [a, b, c, d, e, f, g].
 // Esto facilita iterar en un 'for' para encender/apagar segmentos.
-const PinSegmento mapa_segmentos[7] = {
+const PinSegmento mapeo[7] = {
     {GPIOB, 12}, // Segmento a -> PB12
     {GPIOA, 12}, // Segmento b -> PA12
     {GPIOD, 2},  // Segmento c -> PD2
@@ -72,9 +99,10 @@ const PinSegmento mapa_segmentos[7] = {
     {GPIOC, 11}  // Segmento g -> PC11
 };
 
-// Tabla de codificación 7 segmentos (Ánodo Común / Activo en BAJO -> 0 enciende, 1 apaga).
+// Tabla de codificación 7 segmentos (Activo en BAJO -> 0 enciende, 1 apaga).
 // Los bits representan los segmentos [g f e d c b a] del bit 6 al bit 0.
 const uint8_t tabla_7seg[10] = {
+    //     gfedcba
     0b11000000, // 0
     0b11111001, // 1
     0b10100100, // 2
@@ -94,38 +122,66 @@ int main(void)
 {
     // Inicialización de todos los periféricos
     gpio_init();
+
+    // Pequeña pausa para que las resistencias pull-up/pull-down se estabilicen
+    // y despues se guarda el nivel de cada sensor en reposo (con el haz libre).
+    // IMPORTANTE: al encender, las dos fotocompuertas deben estar libres.
+    for (volatile uint32_t i = 0; i < 200000; i++);
+    nivel_libre_inc = (GPIOA->IDR >> 4) & 1;
+    nivel_libre_dec = (GPIOC->IDR >> 2) & 1;
+
     exti_init();
     tim9_init();
     tim3_init();
 
     while(1){
 
-        // Máquina de estados controlada principalmente por los eventos de interrupción
+        // El refresco del display va FUERA de la maquina de estados para que
+        // siga funcionando en cualquier estado y no se apague mientras se cuenta.
+        if (cambio_digito_flag) {
+            apagar();          // 1. Apagamos todo para evitar sombras/efecto fantasma (ghosting)
+            escribir();        // 2. Colocamos los segmentos del nuevo dígito
+            cambiar_digito();  // 3. Encendemos el común del dígito correspondiente
+
+            cambio_digito_flag = 0; // Limpiamos la bandera
+        }
+
+        // Maquina de estados: las ISR de las fotocompuertas son las que sacan al
+        // sistema de REPOSO y el main lo va llevando por los demas estados.
         switch (Estado) {
 
             case(REPOSO):
-                // Si el Timer 3 avisó que es hora de pasar al siguiente dígito...
-                if (cambio_digito_flag) {
-                    apagar();          // 1. Apagamos todo para evitar sombras/efecto fantasma (ghosting)
-                    escribir();        // 2. Colocamos los segmentos del nuevo dígito
-                    cambiar_digito();  // 3. Encendemos el común del dígito correspondiente
+                // No hace nada, espera a que una interrupcion cambie el estado
+                break;
 
-                    cambio_digito_flag = 0; // Limpiamos la bandera
+            case(AUMENTA):
+                // Da la vuelta: despues de 65535 sigue 0
+                contador++;
+
+                Estado = ESPERA_AUMENTA;   // ya conto, ahora espera a que el sensor se libere
+                break;
+
+            case(ESPERA_AUMENTA):
+                // Mientras el objeto siga tapando el sensor no se hace nada,
+                // asi un mismo paso no se cuenta mas de una vez.
+                if (INC_LIBRE()) {
+                    EXTI->PR = EXTI_PR_PR4;   // se borran flancos que hayan llegado (rebotes) mientras esperaba
+                    Estado = REPOSO;
                 }
                 break;
 
-            case(INCREMENTO):
-                // Aumentamos el contador evitando desbordar de 9999 (da la vuelta a 0)
-                contador++;
-
-                Estado = REPOSO; // Volvemos al estado base
-                break;
-
-            case(DECREMENTO):
-                // Disminuimos el contador (si llega a 0 pasa a 9999)
+            case(DISMINUYE):
+                // Da la vuelta: antes de 0 sigue 65535
                 contador--;
 
-                Estado = REPOSO; // Volvemos al estado base
+                Estado = ESPERA_DISMINUYE;
+                break;
+
+            case(ESPERA_DISMINUYE):
+                if (DEC_LIBRE()) {
+                    EXTI->PR = EXTI_PR_PR2;
+                    Estado = REPOSO;
+                }
                 break;
 
             default:
@@ -139,12 +195,12 @@ int main(void)
  * Configuración de Puertos de Entrada/Salida (GPIO)
  */
 void gpio_init(void){
-    // 1. Encendemos los relojes de todos los puertos de GPIO que utilizaremos
-    RCC->AHB1ENR |= (RCC_AHB1ENR_GPIOAEN | RCC_AHB1ENR_GPIOBEN | 
-                     RCC_AHB1ENR_GPIOCEN | RCC_AHB1ENR_GPIODEN | 
+    // Encendemos los relojes de todos los puertos de GPIO que utilizaremos
+    RCC->AHB1ENR |= (RCC_AHB1ENR_GPIOAEN | RCC_AHB1ENR_GPIOBEN |
+                     RCC_AHB1ENR_GPIOCEN | RCC_AHB1ENR_GPIODEN |
                      RCC_AHB1ENR_GPIOHEN);
 
-    // --- Configuración PH1: LED Heartbeat ---
+    // Configuración PH1: LED de estado
     GPIOH->MODER  &= ~(GPIO_MODER_MODE1);
     GPIOH->MODER  |= (GPIO_MODER_MODE1_0); // Salida
     GPIOH->OTYPER &= ~(GPIO_OTYPER_OT1);    // Push-pull
@@ -152,7 +208,7 @@ void gpio_init(void){
     GPIOH->PUPDR  &= ~(GPIO_PUPDR_PUPD1);
     GPIOH->ODR    &= ~(GPIO_ODR_OD1);       // Inicia apagado
 
-    // --- Configuración Puerto A (Segmentos b, f) ---
+    // Configuramos el Puerto A (Segmentos b, f)
     GPIOA->ODR    |= (GPIO_ODR_OD12|GPIO_ODR_OD11); // Estado inicial en alto (Apagados)
     GPIOA->MODER  &= ~(GPIO_MODER_MODE12|GPIO_MODER_MODE11);
     GPIOA->MODER  |= (GPIO_MODER_MODE12_0|GPIO_MODER_MODE11_0); // Salidas
@@ -160,7 +216,7 @@ void gpio_init(void){
     GPIOA->OSPEEDR &= ~(GPIO_OSPEEDR_OSPEED12|GPIO_OSPEEDR_OSPEED11);
     GPIOA->PUPDR  &= ~(GPIO_PUPDR_PUPD12|GPIO_PUPDR_PUPD11);
 
-    // --- Configuración Puerto C (Segmentos d, e, g y Comunes de Miles, Centenas, Decenas) ---
+    // Configuramos el Puerto C (Segmentos d, e, g y Comunes de Miles, Centenas, Decenas)
     GPIOC->ODR    |= (GPIO_ODR_OD10|GPIO_ODR_OD12|GPIO_ODR_OD11|GPIO_ODR_OD5|GPIO_ODR_OD13|GPIO_ODR_OD6);
     GPIOC->MODER  &= ~(GPIO_MODER_MODE10|GPIO_MODER_MODE12|GPIO_MODER_MODE11|GPIO_MODER_MODE5|GPIO_MODER_MODE13|GPIO_MODER_MODE6);
     GPIOC->MODER  |= (GPIO_MODER_MODE10_0|GPIO_MODER_MODE12_0|GPIO_MODER_MODE11_0|GPIO_MODER_MODE5_0|GPIO_MODER_MODE13_0|GPIO_MODER_MODE6_0);
@@ -168,7 +224,7 @@ void gpio_init(void){
     GPIOC->OSPEEDR &= ~(GPIO_OSPEEDR_OSPEED10|GPIO_OSPEEDR_OSPEED12|GPIO_OSPEEDR_OSPEED11|GPIO_OSPEEDR_OSPEED5|GPIO_OSPEEDR_OSPEED13|GPIO_OSPEEDR_OSPEED6);
     GPIOC->PUPDR  &= ~(GPIO_PUPDR_PUPD10|GPIO_PUPDR_PUPD12|GPIO_PUPDR_PUPD11|GPIO_PUPDR_PUPD5|GPIO_PUPDR_PUPD13|GPIO_PUPDR_PUPD6);
 
-    // --- Configuración Puerto B (Segmento a y Común de Unidades) ---
+    // Configuramos el Puerto B (Segmento a y Común de Unidades)
     GPIOB->ODR    |= (GPIO_ODR_OD12|GPIO_ODR_OD7);
     GPIOB->MODER  &= ~(GPIO_MODER_MODE12|GPIO_MODER_MODE7);
     GPIOB->MODER  |= (GPIO_MODER_MODE12_0|GPIO_MODER_MODE7_0);
@@ -176,7 +232,7 @@ void gpio_init(void){
     GPIOB->OSPEEDR &= ~(GPIO_OSPEEDR_OSPEED12|GPIO_OSPEEDR_OSPEED7);
     GPIOB->PUPDR  &= ~(GPIO_PUPDR_PUPD12|GPIO_PUPDR_PUPD7);
 
-    // --- Configuración Puerto D (Segmento c) ---
+    // Configuramos el Puerto D (Segmento c)
     GPIOD->ODR    |= (GPIO_ODR_OD2);
     GPIOD->MODER  &= ~(GPIO_MODER_MODE2);
     GPIOD->MODER  |= (GPIO_MODER_MODE2_0);
@@ -184,9 +240,9 @@ void gpio_init(void){
     GPIOD->OSPEEDR &= ~(GPIO_OSPEEDR_OSPEED2);
     GPIOD->PUPDR  &= ~(GPIO_PUPDR_PUPD2);
 
-    // --- Configuración Entradas para Fotocompuertas ---
-    
-    // PA4: Fotocompuerta Incremento
+    // Configuración de Entradas para las Fotocompuertas
+
+    // PA4: Fotocompuerta Aumenta
     GPIOA->MODER &= ~(GPIO_MODER_MODE4); // Modo Entrada (00)
     GPIOA->PUPDR &= ~(GPIO_PUPDR_PUPD4);
 #if SENSOR_INC_ACTIVO_BAJO
@@ -195,7 +251,7 @@ void gpio_init(void){
     GPIOA->PUPDR |= (GPIO_PUPDR_PUPD4_1); // Pull-down si activa por alto
 #endif
 
-    // PC2: Fotocompuerta Decremento
+    // PC2: Fotocompuerta disminucion
     GPIOC->MODER &= ~(GPIO_MODER_MODE2); // Modo Entrada (00)
     GPIOC->PUPDR &= ~(GPIO_PUPDR_PUPD2);
 #if SENSOR_DEC_ACTIVO_BAJO
@@ -244,19 +300,23 @@ void exti_init(void){
     NVIC_EnableIRQ(EXTI2_IRQn);
 }
 
-// ISR: Fotocompuerta PA4 (Incrementar)
+// ISR: Fotocompuerta PA4 (Aumento)
 void EXTI4_IRQHandler(void){
     if (EXTI->PR & EXTI_PR_PR4){
         EXTI->PR = EXTI_PR_PR4;  // Limpiar bandera escribiendo 1
-        Estado = INCREMENTO;      // Solicitamos al main que incremente
+
+        // Solo se acepta el evento si el sistema esta en REPOSO.
+        // Si ya hay un conteo en proceso, este evento se ignora (no se pisa el estado).
+        if (Estado == REPOSO) Estado = AUMENTA;
     }
 }
 
-// ISR: Fotocompuerta PC2 (Decrementar)
+// ISR: Fotocompuerta PC2 (Disminuye)
 void EXTI2_IRQHandler(void){
     if (EXTI->PR & EXTI_PR_PR2){
         EXTI->PR = EXTI_PR_PR2;  // Limpiar bandera escribiendo 1
-        Estado = DECREMENTO;      // Solicitamos al main que decremente
+
+        if (Estado == REPOSO) Estado = DISMINUYE;
     }
 }
 
@@ -273,7 +333,7 @@ void tim9_init(void){
     TIM9->CR1 &= ~(TIM_CR1_CKD);
     TIM9->CR1 &= ~(TIM_CR1_ARPE);
     TIM9->SR = ~(TIM_SR_UIF);
-    
+
     NVIC_EnableIRQ(TIM1_BRK_TIM9_IRQn);
     TIM9->CR1 |= (TIM_CR1_CEN); // Arrancar Timer 9
 }
@@ -300,7 +360,7 @@ void tim3_init(void){
     TIM3->CR1 &= ~(TIM_CR1_ARPE);
     TIM3->CR1 &= ~(TIM_CR1_DIR);
     TIM3->SR = ~(TIM_SR_UIF);
-    
+
     NVIC_EnableIRQ(TIM3_IRQn);
     TIM3->CR1 |= (TIM_CR1_CEN); // Arrancar Timer 3
 }
@@ -309,7 +369,7 @@ void tim3_init(void){
 void TIM3_IRQHandler(void){
     if(TIM3->SR & TIM_SR_UIF){
         TIM3->SR = ~(TIM_SR_UIF);
-        
+
         // Rotamos entre los 4 dígitos (0 -> 1 -> 2 -> 3 -> 0)
         digito_actual = (digito_actual + 1) % 4;
         cambio_digito_flag = 1; // Bandera para procesar el refresco en main()
@@ -328,7 +388,7 @@ void apagar(void){
 }
 
 /*
- * Activa el cátodo/ánodo común del dígito que toca mostrar 
+ * Activa el común del dígito que toca mostrar
  * y calcula el número individual (Miles, Centenas, Decenas o Unidades).
  */
 void cambiar_digito(void){
@@ -353,7 +413,7 @@ void cambiar_digito(void){
 }
 
 /*
- * Toma el número a mostrar (0 a 9), consulta la tabla de segmentos 
+ * Toma el número a mostrar (0 a 9), consulta la tabla de segmentos
  * y aplica bit por bit el estado correspondiente a los pines de la tarjeta.
  */
 void escribir(void){
@@ -364,11 +424,11 @@ void escribir(void){
 
         if(bit == 0){
             // Enciende el segmento mandando un 0
-            mapa_segmentos[i].puerto->ODR &= ~(0b1 << mapa_segmentos[i].pin);
+            mapeo[i].puerto->ODR &= ~(0b1 << mapeo[i].pin);
         }
         else{
             // Apaga el segmento mandando un 1
-            mapa_segmentos[i].puerto->ODR |= (0b1 << mapa_segmentos[i].pin);
+            mapeo[i].puerto->ODR |= (0b1 << mapeo[i].pin);
         }
     }
 }
