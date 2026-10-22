@@ -1,5 +1,21 @@
-/* main.c
- * Contador de 4 digitos (0 a 9999) en display de 7 segmentos multiplexado.
+/**
+ ******************************************************************************
+ * @file           : main.c
+ * @author         : Aaron Igor Vasquez Gil
+ * @brief          : Main program body
+ ******************************************************************************
+ * @attention
+ *
+ * Copyright (c) 2025 STMicroelectronics.
+ * All rights reserved.
+ *
+ * This software is licensed under terms that can be found in the LICENSE file
+ * in the root directory of this software component.
+ * If no LICENSE file comes with this software, it is provided AS-IS.
+ *
+ ******************************************************************************
+ *
+ * Contador de 4 digitos (0 a 65535) en display de 7 segmentos multiplexado.
  * La fotocompuerta de PA4 aumenta el contador y la de PC2 lo disminuye.
  * El led de PH1 parpadea cada segundo para saber que la tarjeta esta funcionando.
  *
@@ -13,19 +29,36 @@
  * PA4 ----- Aumenta (EXTI4)
  * PC2 ----- Disminuye (EXTI2)
  *
- * Maquina de estados:
+ * LED de estado ----- PH1
  *
- *                 PA4 detecta                 main cuenta
- *   REPOSO ------------------> AUMENTA ---------------------> ESPERA_AUMENTA
- *     ^                                                            |
- *     |                  PA4 se libera                             |
- *     +------------------------------------------------------------+
  *
- *                 PC2 detecta                 main cuenta
- *   REPOSO ------------------> DISMINUYE -------------------> ESPERA_DISMINUYE
- *     ^                                                            |
- *     |                  PC2 se libera                             |
- *     +------------------------------------------------------------+
+ * FUNCIONAMIENTO DEL SISTEMA
+ * - Arranque: tras configurar los GPIO se espera un momento y se lee una sola
+ *   vez el nivel de cada fotocompuerta con el haz libre (nivel_libre_inc y
+ *   nivel_libre_dec). Por eso las dos deben estar libres al encender.
+ * - TIM9 (interrupción cada 1 s): invierte PH1, así el LED queda 1 s
+ *   encendido y 1 s apagado (blinky de 0,5 Hz) e indica que el MCU funciona.
+ * - TIM3 (interrupción cada 3 ms): avanza al siguiente dígito y levanta
+ *   cambio_digito_flag. Los 4 dígitos se barren en 12 ms (~83 Hz), por lo
+ *   que el ojo los percibe encendidos a la vez (efecto POV). En cada cambio
+ *   se apaga todo antes de escribir el siguiente dígito para evitar el
+ *   "fantasma".
+ * - EXTI4 (PA4) y EXTI2 (PC2): cada ISR baja su bandera y, solo si el sistema
+ *   está en REPOSO, pasa el estado a AUMENTA o DISMINUYE. Si ya hay un
+ *   conteo en proceso, el evento se ignora.
+ * - Total: 4 interrupciones (TIM9, TIM3, EXTI4, EXTI2).
+ *
+ * MÁQUINA DE ESTADOS (main)
+ *
+ *   El refresco del display va fuera de la máquina de estados, así que se
+ *   ejecuta en cualquier estado y la pantalla no se apaga mientras se cuenta.
+ *
+ *   REPOSO           : espera a que una ISR cambie el estado.
+ *   AUMENTA          : suma 1 al contador (una sola vez).
+ *   ESPERA_AUMENTA   : espera a que PA4 vuelva a su nivel libre, borra los
+ *                      flancos pendientes (rebotes) y vuelve a REPOSO.
+ *   DISMINUYE        : resta 1 al contador (una sola vez).
+ *   ESPERA_DISMINUYE : igual que ESPERA_AUMENTA, pero con PC2.
  */
 
 #include <stdint.h>
